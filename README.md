@@ -1284,7 +1284,193 @@ function seedDemoData() {
 
 initApp();
 </script>
-<!-- ===== SUPER ADMIN + ROLE-BASED ACCESS CONTROL ===== -->
+<!-- ===== GITHUB DATABASE ENGINE ===== -->
+<script>
+(function(){
+  /* ==========================================================
+     KONFIGURASI DATABASE GITHUB
+     Ganti nilai di bawah ini dengan data repository kamu.
+     INSTRUKSI:
+     1. Buat repository GitHub baru (atau pakai yang sudah ada)
+     2. Buat Personal Access Token (PAT) di:
+        Settings > Developer settings > Personal access tokens > Fine-grained tokens
+        - Beri akses: "Contents" (Read & Write)
+        - Repository access: Pilih hanya repository ini
+     3. Isi variabel di bawah ini:
+     ========================================================== */
+  var DB_CONFIG = {
+    owner: 'USERNAME_GITHUB_KAMU',       // Ganti dengan username GitHub
+    repo: 'NAMA_REPOSITORY_KAMU',        // Ganti dengan nama repo
+    token: 'GANTI_DENGAN_TOKEN_KAMU',    // Ganti dengan Personal Access Token
+    branch: 'main',                      // Biasanya 'main' atau 'master'
+    file: 'db.json'                      // Nama file database
+  };
+  /* ========================================================== */
+
+  var API_URL = 'https://api.github.com/repos/' + DB_CONFIG.owner + '/' + DB_CONFIG.repo + '/contents/' + DB_CONFIG.file;
+  var HEADERS = {
+    'Authorization': 'Bearer ' + DB_CONFIG.token,
+    'Accept': 'application/vnd.github.v3+json',
+    'Content-Type': 'application/json'
+  };
+
+  // Cache lokal untuk mengurangi request ke GitHub (opsional tapi disarankan)
+  var _dbCache = null;
+  var _dbSha = null;
+  var _isOnline = false;
+  var _pendingSync = false;
+
+  // Cek apakah sudah dikonfigurasi
+  function isConfigured(){
+    return DB_CONFIG.owner !== 'USERNAME_GITHUB_KAMU' && DB_CONFIG.token !== 'GANTI_DENGAN_TOKEN_KAMU';
+  }
+
+  // Ambil SHA file terbaru (diperlukan untuk update)
+  function fetchDB(callback){
+    fetch(API_URL + '?ref=' + DB_CONFIG.branch, { headers: HEADERS })
+      .then(function(r){
+        if(!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      })
+      .then(function(res){
+        _dbSha = res.sha;
+        _dbCache = JSON.parse(atob(res.content));
+        _isOnline = true;
+        callback(null, _dbCache);
+      })
+      .catch(function(err){
+        console.warn('GitHub DB fetch error:', err.message);
+        _isOnline = false;
+        // Fallback ke localStorage jika GitHub gagal
+        try {
+          var local = localStorage.getItem('ecoSportData');
+          _dbCache = local ? JSON.parse(local) : emptyData();
+        } catch(e) {
+          _dbCache = emptyData();
+        }
+        callback(null, _dbCache);
+      });
+  }
+
+  // Push data ke GitHub
+  function pushDB(data, callback){
+    if(!isConfigured()){
+      return callback(new Error('Database belum dikonfigurasi'));
+    }
+    var content = btoa(unescape(encodeURIComponent(JSON.stringify(data, null, 2))));
+    var body = {
+      message: 'Update database from Eco Sport Panel [' + new Date().toLocaleString('id-ID') + ']',
+      content: content,
+      sha: _dbSha
+    };
+    fetch(API_URL, {
+      method: 'PUT',
+      headers: HEADERS,
+      body: JSON.stringify(body)
+    })
+    .then(function(r){
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    })
+    .then(function(res){
+      _dbSha = res.content.sha;
+      _dbCache = data;
+      callback(null);
+    })
+    .catch(function(err){
+      console.error('GitHub DB push error:', err.message);
+      callback(err);
+    });
+  }
+
+  // Override fungsi Load & Save asli
+  var _origLoadData = window.loadData;
+  var _origSaveData = window.saveData;
+  var _origLoadAdmins;
+
+  window.loadData = function(){
+    // Jika cache sudah ada (setelah fetch pertama), pakai cache
+    if(_dbCache) return JSON.parse(JSON.stringify(_dbCache));
+    // Jika belum, kembalikan data kosong dulu (akan di-replace oleh fetchDB)
+    return emptyData();
+  };
+
+  window.saveData = function(d){
+    _dbCache = JSON.parse(JSON.stringify(d));
+    // Selalu simpan ke localStorage sebagai backup
+    _origSaveData(d);
+    // Sync ke GitHub (debounce 2 detik)
+    if(isConfigured()){
+      clearTimeout(window._githubSaveTimeout);
+      window._githubSaveTimeout = setTimeout(function(){
+        pushDB(_dbCache, function(err){
+          if(!err){
+            // Berhasil sync
+          } else {
+            toast('Gagal sync ke database online', 'warning');
+          }
+        });
+      }, 2000);
+    }
+  };
+
+  // Override loadAdmins di Super Admin module (jika sudah dimuat)
+  function patchAdminLoader(){
+    if(window.loadAdmins && !window.loadAdmins._patched){
+      _origLoadAdmins = window.loadAdmins;
+      window.loadAdmins = function(){
+        if(_dbCache && _dbCache.admins) return JSON.parse(JSON.stringify(_dbCache.admins));
+        return _origLoadAdmins();
+      };
+      window.loadAdmins._patched = true;
+    }
+    if(window.saveAdmins && !window.saveAdmins._patched){
+      var _origSaveAdmins = window.saveAdmins;
+      window.saveAdmins = function(list){
+        if(_dbCache){
+          _dbCache.admins = list;
+          window.saveData(_dbCache);
+        }
+        _origSaveAdmins(list);
+      };
+      window.saveAdmins._patched = true;
+    }
+  }
+
+  // Inisialisasi saat app dimuat
+  function initDB(){
+    if(!isConfigured()){
+      console.info('GitHub DB: Mode Offline (localStorage). Konfigurasi DB_CONFIG untuk mode online.');
+      return;
+    }
+    fetchDB(function(err, data){
+      if(!err){
+        APP.data = data;
+        patchAdminLoader();
+        // Re-render halaman saat ini setelah data selesai dimuat
+        if(APP.isLoggedIn && typeof window.render === 'function'){
+          window.render();
+        }
+      }
+    });
+  }
+
+  // Jalankan setelah DOM siap
+  if(document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', initDB);
+  } else {
+    initDB();
+  }
+
+  // Expose untuk debugging (bisa dihapus di production)
+  window.__githubDB = {
+    status: function(){ return _isOnline ? 'Online' : 'Offline (localStorage)'; },
+    sync: function(){ fetchDB(function(e,d){ if(!e) window.render(); }); },
+    push: function(){ if(_dbCache) pushDB(_dbCache, function(e){ if(!e) toast('Manual sync berhasil','success'); else toast('Sync gagal','error'); }); }
+  };
+
+})();
+</script><!-- ===== SUPER ADMIN + ROLE-BASED ACCESS CONTROL ===== -->
 <!-- Sisipkan blok ini sebelum </body>, jangan ubah kode di atasnya -->
 <script>
 (function(){
